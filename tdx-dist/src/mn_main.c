@@ -116,6 +116,7 @@ static int td_find_config(int argc, char **argv, const char **path) {
 }
 
 static int td_request_server_run(td_local_region_t *region, volatile sig_atomic_t *stop_flag, size_t eviction_threshold_pct, char *err, size_t err_len) {
+    unsigned long diag_counter = 0;
     while (!(*stop_flag)) {
         int rc = td_request_consume_once(region, eviction_threshold_pct, err, err_len);
 
@@ -124,6 +125,16 @@ static int td_request_server_run(td_local_region_t *region, volatile sig_atomic_
         }
         if (rc == 0) {
             usleep(100);
+        }
+        if (++diag_counter % 50000 == 0) {
+            td_request_ring_t *ring = td_region_request_ring_ptr(region);
+            fprintf(stdout, "tdx-dist mn ring diag: head=%llu reserve_head=%llu tail=%llu cap=%llu (iter=%lu)\n",
+                (unsigned long long)ring->head,
+                (unsigned long long)ring->reserve_head,
+                (unsigned long long)ring->tail,
+                (unsigned long long)ring->capacity,
+                diag_counter);
+            fflush(stdout);
         }
     }
     return 0;
