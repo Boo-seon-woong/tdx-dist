@@ -78,6 +78,13 @@ void td_region_invalidate_ptr(td_local_region_t *region, const void *ptr, size_t
     td_region_clflush_ptr(region, ptr, len);
 }
 
+void td_region_flush_all(td_local_region_t *region) {
+    if (region == NULL || region->base == NULL || region->mapped_bytes == 0) {
+        return;
+    }
+    td_region_clflush_ptr(region, region->base, region->mapped_bytes);
+}
+
 static void td_region_initialize(td_local_region_t *region, const td_config_t *cfg) {
     td_request_ring_t *ring;
 
@@ -106,6 +113,7 @@ static void td_region_initialize(td_local_region_t *region, const td_config_t *c
     ring->tail = 0;
     ring->capacity = cfg->request_slots;
     ring->entry_size = sizeof(td_request_entry_t);
+    td_region_flush_all(region);
 }
 
 static int td_region_validate(const td_local_region_t *region, const td_config_t *cfg, char *err, size_t err_len) {
