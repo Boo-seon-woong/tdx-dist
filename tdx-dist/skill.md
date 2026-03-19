@@ -74,7 +74,8 @@ ring은 `reserve_head / head / tail` 3개 counter를 쓴다.
 - guest MN에 RDMA server thread를 다시 넣지 않는다.
 - host가 request payload를 해석하거나 slot body를 memcpy 하지 않는다.
 - slot publish 순서는 `visible/body -> release fence -> guard_epoch`를 유지한다.
-- config preset을 바꾸면 host config와 guest MN config의 `memory_file`, `mn_memory_size`, `request_slots`, slot layout 값이 항상 같아야 한다.
+- config preset을 바꾸면 host config와 guest MN config의 `mn_memory_size`, `request_slots`, slot layout 값이 항상 같아야 한다.
+- TDX VM에서는 `memory_file` path 문자열이 달라도 된다. 대신 virtio-fs 같은 메커니즘을 통해 같은 backing file을 가리켜야 한다.
 
 ## 중요한 파일
 

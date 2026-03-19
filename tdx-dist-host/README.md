@@ -39,7 +39,14 @@ make -C tdx-dist-host
 
 ## 주의
 
-- `memory_file`, `mn_memory_size`, `request_slots`, slot layout은 guest MN 쪽 preset과 반드시 같아야 한다.
+- `mn_memory_size`, `request_slots`, slot layout은 guest MN 쪽 preset과 반드시 같아야 한다.
+- `memory_file`은 guest와 path 문자열이 달라도 된다. 대신 같은 backing file을 가리켜야 한다.
 - host는 request를 해석하지 않는다.
 - host는 slot body를 읽거나 쓰지 않는다.
 - host는 RDMA data path fallback을 제공하지 않는다.
+
+TDX VM preset은 다음 전제를 둔다.
+
+- host preset: `/tmp/tdx-dist-share/...`
+- guest preset: `/mnt/tdx-dist-share/...`
+- guest는 `run_td --shared-dir /tmp/tdx-dist-share`로 VM을 띄운 뒤 `mount -t virtiofs tdx-dist-share /mnt/tdx-dist-share`를 먼저 수행한다.
