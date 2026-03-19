@@ -40,6 +40,15 @@ typedef struct {
 
 int td_tcp_client_connect(td_session_t *session, const td_endpoint_t *endpoint, char *err, size_t err_len);
 
+static int td_rdma_mr_access(int base_access, td_tdx_mode_t tdx_mode) {
+#ifdef IBV_ACCESS_ON_DEMAND
+    if (tdx_mode == TD_TDX_ON) {
+        return base_access | IBV_ACCESS_ON_DEMAND;
+    }
+#endif
+    return base_access;
+}
+
 static uint64_t td_rdma_profile_begin(td_session_t *session) {
     return session->transport_profile != NULL ? td_now_ns() : 0;
 }
@@ -142,7 +151,7 @@ static void td_rdma_destroy_impl(td_rdma_impl_t *impl) {
     memset(impl, 0, sizeof(*impl));
 }
 
-static int td_rdma_setup_impl(td_rdma_impl_t *impl, size_t op_buf_len, char *err, size_t err_len) {
+static int td_rdma_setup_impl(td_rdma_impl_t *impl, size_t op_buf_len, td_tdx_mode_t tdx_mode, char *err, size_t err_len) {
     struct ibv_qp_init_attr qp_attr;
 
     impl->pd = ibv_alloc_pd(impl->id->verbs);
@@ -174,8 +183,8 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, size_t op_buf_len, char *err
         return -1;
     }
 
-    impl->op_mr = ibv_reg_mr(impl->pd, impl->op_buf, impl->op_buf_len, IBV_ACCESS_LOCAL_WRITE);
-    impl->cas_mr = ibv_reg_mr(impl->pd, impl->cas_buf, sizeof(uint64_t), IBV_ACCESS_LOCAL_WRITE);
+    impl->op_mr = ibv_reg_mr(impl->pd, impl->op_buf, impl->op_buf_len, td_rdma_mr_access(IBV_ACCESS_LOCAL_WRITE, tdx_mode));
+    impl->cas_mr = ibv_reg_mr(impl->pd, impl->cas_buf, sizeof(uint64_t), td_rdma_mr_access(IBV_ACCESS_LOCAL_WRITE, tdx_mode));
     if (impl->op_mr == NULL || impl->cas_mr == NULL) {
         td_format_error(err, err_len, "rdma mr registration failed");
         return -1;
@@ -367,7 +376,7 @@ static void td_rdma_client_close(td_session_t *session) {
     session->impl = NULL;
 }
 
-static int td_rdma_client_connect(td_session_t *session, const td_endpoint_t *endpoint, char *err, size_t err_len) {
+static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg, const td_endpoint_t *endpoint, char *err, size_t err_len) {
     struct rdma_addrinfo hints;
     struct rdma_addrinfo *res = NULL;
     struct rdma_cm_event *event = NULL;
@@ -420,7 +429,7 @@ static int td_rdma_client_connect(td_session_t *session, const td_endpoint_t *en
     rdma_ack_cm_event(event);
     rdma_freeaddrinfo(res);
 
-    if (td_rdma_setup_impl(impl, sizeof(td_request_entry_t), err, err_len) != 0) {
+    if (td_rdma_setup_impl(impl, sizeof(td_request_entry_t), cfg->tdx, err, err_len) != 0) {
         td_rdma_destroy_impl(impl);
         free(impl);
         return -1;
@@ -491,7 +500,12 @@ static void td_rdma_destroy_host_conn(td_rdma_host_conn_t *conn) {
     free(conn);
 }
 
-static int td_rdma_host_setup_conn(td_rdma_host_conn_t *conn, td_local_region_t *region, char *err, size_t err_len) {
+static int td_rdma_host_setup_conn(
+    td_rdma_host_conn_t *conn,
+    const td_config_t *cfg,
+    td_local_region_t *region,
+    char *err,
+    size_t err_len) {
     struct ibv_qp_init_attr qp_attr;
 
     conn->pd = ibv_alloc_pd(conn->id->verbs);
@@ -519,7 +533,9 @@ static int td_rdma_host_setup_conn(td_rdma_host_conn_t *conn, td_local_region_t 
         conn->pd,
         region->base,
         region->mapped_bytes,
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
+        td_rdma_mr_access(
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC,
+            cfg->tdx));
     if (conn->region_mr == NULL) {
         td_format_error(err, err_len, "rdma host ibv_reg_mr failed");
         return -1;
@@ -592,13 +608,16 @@ int td_rdma_host_run(const td_config_t *cfg, td_local_region_t *region, volatile
                 td_rdma_host_conn_t *conn = (td_rdma_host_conn_t *)calloc(1, sizeof(*conn));
 
                 if (conn == NULL) {
+                    fprintf(stderr, "rdma host rejected connect request: out of memory\n");
                     (void)rdma_reject(event->id, NULL, 0);
                 } else {
                     td_rdma_connect_info_t info;
                     struct rdma_conn_param conn_param;
 
                     conn->id = event->id;
-                    if (td_rdma_host_setup_conn(conn, region, err, err_len) != 0) {
+                    if (td_rdma_host_setup_conn(conn, cfg, region, err, err_len) != 0) {
+                        fprintf(stderr, "rdma host rejected connect request: %s\n", err);
+                        fflush(stderr);
                         (void)rdma_reject(event->id, NULL, 0);
                         dispose_conn = conn;
                     } else {
@@ -617,6 +636,9 @@ int td_rdma_host_run(const td_config_t *cfg, td_local_region_t *region, volatile
                         conn_param.private_data_len = sizeof(info);
 
                         if (rdma_accept(event->id, &conn_param) != 0) {
+                            td_format_error(err, err_len, "rdma host accept failed: %s", strerror(errno));
+                            fprintf(stderr, "%s\n", err);
+                            fflush(stderr);
                             dispose_conn = conn;
                         } else {
                             conn->next = connections;
@@ -673,7 +695,7 @@ int td_session_connect(td_session_t *session, const td_config_t *cfg, const td_e
     if (cfg->transport == TD_TRANSPORT_TCP) {
         return td_tcp_client_connect(session, endpoint, err, err_len);
     }
-    return td_rdma_client_connect(session, endpoint, err, err_len);
+    return td_rdma_client_connect(session, cfg, endpoint, err, err_len);
 }
 
 void td_session_close(td_session_t *session) {
