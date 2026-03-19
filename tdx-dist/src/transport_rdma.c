@@ -18,6 +18,10 @@ typedef struct {
     struct ibv_cq *cq;
     struct ibv_mr *op_mr;
     struct ibv_mr *cas_mr;
+    void *workbuf_base;
+    size_t workbuf_len;
+    int workbuf_fd;
+    int use_tdx_shm;
     unsigned char *op_buf;
     uint64_t *cas_buf;
     size_t op_buf_len;
@@ -40,12 +44,12 @@ typedef struct {
 
 int td_tcp_client_connect(td_session_t *session, const td_endpoint_t *endpoint, char *err, size_t err_len);
 
+static int td_rdma_use_tdx_shm(td_tdx_mode_t tdx_mode) {
+    return tdx_mode == TD_TDX_ON && access(TD_TDX_SHM_DEVICE, R_OK | W_OK) == 0;
+}
+
 static int td_rdma_mr_access(int base_access, td_tdx_mode_t tdx_mode) {
-#ifdef IBV_ACCESS_ON_DEMAND
-    if (tdx_mode == TD_TDX_ON) {
-        return base_access | IBV_ACCESS_ON_DEMAND;
-    }
-#endif
+    (void)tdx_mode;
     return base_access;
 }
 
@@ -146,13 +150,24 @@ static void td_rdma_destroy_impl(td_rdma_impl_t *impl) {
     if (impl->ec != NULL) {
         rdma_destroy_event_channel(impl->ec);
     }
-    free(impl->op_buf);
-    free(impl->cas_buf);
+    if (impl->use_tdx_shm) {
+        if (impl->workbuf_base != NULL && impl->workbuf_len > 0) {
+            munmap(impl->workbuf_base, impl->workbuf_len);
+        }
+        if (impl->workbuf_fd >= 0) {
+            close(impl->workbuf_fd);
+        }
+    } else {
+        free(impl->workbuf_base);
+    }
     memset(impl, 0, sizeof(*impl));
+    impl->workbuf_fd = -1;
 }
 
 static int td_rdma_setup_impl(td_rdma_impl_t *impl, size_t op_buf_len, td_tdx_mode_t tdx_mode, char *err, size_t err_len) {
     struct ibv_qp_init_attr qp_attr;
+    size_t cas_offset = (op_buf_len + (sizeof(uint64_t) - 1)) & ~(sizeof(uint64_t) - 1);
+    char alloc_err[128];
 
     impl->pd = ibv_alloc_pd(impl->id->verbs);
     impl->cq = ibv_create_cq(impl->id->verbs, 128, NULL, NULL, 0);
@@ -175,13 +190,24 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, size_t op_buf_len, td_tdx_mo
         return -1;
     }
 
-    impl->op_buf = (unsigned char *)calloc(1, op_buf_len);
-    impl->cas_buf = (uint64_t *)calloc(1, sizeof(uint64_t));
+    impl->workbuf_fd = -1;
+    impl->workbuf_len = cas_offset + sizeof(uint64_t);
     impl->op_buf_len = op_buf_len;
-    if (impl->op_buf == NULL || impl->cas_buf == NULL) {
-        td_format_error(err, err_len, "rdma buffer allocation failed");
-        return -1;
+    if (td_rdma_use_tdx_shm(tdx_mode)) {
+        if (td_tdx_shm_open(impl->workbuf_len, &impl->workbuf_fd, &impl->workbuf_base, alloc_err, sizeof(alloc_err)) != 0) {
+            td_format_error(err, err_len, "rdma shared buffer allocation failed: %s", alloc_err);
+            return -1;
+        }
+        impl->use_tdx_shm = 1;
+    } else {
+        impl->workbuf_base = calloc(1, impl->workbuf_len);
+        if (impl->workbuf_base == NULL) {
+            td_format_error(err, err_len, "rdma buffer allocation failed");
+            return -1;
+        }
     }
+    impl->op_buf = (unsigned char *)impl->workbuf_base;
+    impl->cas_buf = (uint64_t *)((unsigned char *)impl->workbuf_base + cas_offset);
 
     impl->op_mr = ibv_reg_mr(impl->pd, impl->op_buf, impl->op_buf_len, td_rdma_mr_access(IBV_ACCESS_LOCAL_WRITE, tdx_mode));
     impl->cas_mr = ibv_reg_mr(impl->pd, impl->cas_buf, sizeof(uint64_t), td_rdma_mr_access(IBV_ACCESS_LOCAL_WRITE, tdx_mode));

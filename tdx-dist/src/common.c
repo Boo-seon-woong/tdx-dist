@@ -1,11 +1,14 @@
 #include "td_common.h"
 
+#include <fcntl.h>
 #include <ctype.h>
+#include <sys/mman.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 uint64_t td_hash64_bytes(const void *data, size_t len) {
     const unsigned char *bytes = (const unsigned char *)data;
@@ -113,5 +116,32 @@ int td_parse_host_port(const char *input, td_endpoint_t *endpoint) {
     if (endpoint->host[0] == '\0' || endpoint->port <= 0) {
         return -1;
     }
+    return 0;
+}
+
+int td_tdx_shm_open(size_t bytes, int *fd_out, void **base_out, char *err, size_t err_len) {
+    int fd;
+    void *mapped;
+
+    if (bytes == 0 || fd_out == NULL || base_out == NULL) {
+        td_format_error(err, err_len, "invalid tdx shared memory request");
+        return -1;
+    }
+
+    fd = open(TD_TDX_SHM_DEVICE, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        td_format_error(err, err_len, "cannot open %s", TD_TDX_SHM_DEVICE);
+        return -1;
+    }
+
+    mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        td_format_error(err, err_len, "mmap failed for %s", TD_TDX_SHM_DEVICE);
+        close(fd);
+        return -1;
+    }
+
+    *fd_out = fd;
+    *base_out = mapped;
     return 0;
 }

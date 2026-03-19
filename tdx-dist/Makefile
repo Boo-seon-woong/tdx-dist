@@ -4,6 +4,8 @@ LDLIBS := -lpthread -lcrypto -libverbs -lrdmacm
 BIN_DIR := bin
 SRC_DIR := src
 BENCH_DIR := benchmark
+KMOD_DIR := kmod
+KDIR ?= /lib/modules/$(shell uname -r)/build
 
 COMMON_SRCS := \
 	$(SRC_DIR)/common.c \
@@ -34,5 +36,9 @@ $(BIN_DIR)/cn_bench: $(COMMON_SRCS) $(BENCH_DIR)/cn_bench.c | $(BIN_DIR)
 
 clean:
 	rm -f $(BIN_DIR)/cn $(BIN_DIR)/mn $(BIN_DIR)/host $(BIN_DIR)/cn_bench
+	if [ -d "$(KDIR)" ]; then $(MAKE) -C $(KDIR) M=$(CURDIR)/$(KMOD_DIR) clean; fi
 
-.PHONY: all clean
+kmod:
+	$(MAKE) -C $(KDIR) M=$(CURDIR)/$(KMOD_DIR) modules
+
+.PHONY: all clean kmod

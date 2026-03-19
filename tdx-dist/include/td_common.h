@@ -18,6 +18,7 @@
 #define TD_KEY_BYTES 128
 #define TD_CMD_BYTES 512
 #define TD_RECV_QUEUE_DEPTH 32
+#define TD_TDX_SHM_DEVICE "/dev/tdx_shm"
 
 #define TD_SLOT_FLAG_VALID 0x1u
 #define TD_SLOT_FLAG_TOMBSTONE 0x2u
@@ -62,5 +63,6 @@ char *td_trim(char *text);
 int td_hex_to_bytes(const char *hex, unsigned char *out, size_t out_len);
 void td_format_error(char *buf, size_t buf_len, const char *fmt, ...);
 int td_parse_host_port(const char *input, td_endpoint_t *endpoint);
+int td_tdx_shm_open(size_t bytes, int *fd_out, void **base_out, char *err, size_t err_len);
 
 #endif

@@ -23,6 +23,13 @@ static int td_region_is_owner(const td_config_t *cfg) {
     return 0;
 }
 
+static int td_region_use_tdx_shm(const td_config_t *cfg) {
+    if (cfg->tdx != TD_TDX_ON || cfg->transport != TD_TRANSPORT_RDMA || cfg->mode != TD_MODE_MN) {
+        return 0;
+    }
+    return access(TD_TDX_SHM_DEVICE, R_OK | W_OK) == 0;
+}
+
 static void td_region_initialize(td_local_region_t *region, const td_config_t *cfg) {
     td_request_ring_t *ring;
 
@@ -104,40 +111,47 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
     int open_flags = td_region_is_owner(cfg) ? (O_RDWR | O_CREAT) : O_RDWR;
     struct stat st;
     void *mapped;
+    int use_tdx_shm = td_region_use_tdx_shm(cfg);
 
     memset(region, 0, sizeof(*region));
     region->fd = -1;
 
-    region->fd = open(cfg->memory_file, open_flags, 0600);
-    if (region->fd < 0) {
-        td_format_error(err, err_len, "cannot open shared region %s", cfg->memory_file);
-        return -1;
-    }
-    if (td_region_is_owner(cfg) && ftruncate(region->fd, (off_t)bytes) != 0) {
-        td_format_error(err, err_len, "cannot size shared region %s", cfg->memory_file);
-        close(region->fd);
-        region->fd = -1;
-        return -1;
-    }
-    if (!td_region_is_owner(cfg) && (fstat(region->fd, &st) != 0 || (size_t)st.st_size < bytes)) {
-        td_format_error(err, err_len, "shared region %s is smaller than expected", cfg->memory_file);
-        close(region->fd);
-        region->fd = -1;
-        return -1;
-    }
+    if (use_tdx_shm) {
+        if (td_tdx_shm_open(bytes, &region->fd, &mapped, err, err_len) != 0) {
+            return -1;
+        }
+    } else {
+        region->fd = open(cfg->memory_file, open_flags, 0600);
+        if (region->fd < 0) {
+            td_format_error(err, err_len, "cannot open shared region %s", cfg->memory_file);
+            return -1;
+        }
+        if (td_region_is_owner(cfg) && ftruncate(region->fd, (off_t)bytes) != 0) {
+            td_format_error(err, err_len, "cannot size shared region %s", cfg->memory_file);
+            close(region->fd);
+            region->fd = -1;
+            return -1;
+        }
+        if (!td_region_is_owner(cfg) && (fstat(region->fd, &st) != 0 || (size_t)st.st_size < bytes)) {
+            td_format_error(err, err_len, "shared region %s is smaller than expected", cfg->memory_file);
+            close(region->fd);
+            region->fd = -1;
+            return -1;
+        }
 
-    mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, region->fd, 0);
-    if (mapped == MAP_FAILED) {
-        td_format_error(err, err_len, "mmap failed for %s", cfg->memory_file);
-        close(region->fd);
-        region->fd = -1;
-        return -1;
+        mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, region->fd, 0);
+        if (mapped == MAP_FAILED) {
+            td_format_error(err, err_len, "mmap failed for %s", cfg->memory_file);
+            close(region->fd);
+            region->fd = -1;
+            return -1;
+        }
     }
 
     region->base = mapped;
     region->mapped_bytes = bytes;
     region->header = (td_region_header_t *)mapped;
-    snprintf(region->backing_path, sizeof(region->backing_path), "%s", cfg->memory_file);
+    snprintf(region->backing_path, sizeof(region->backing_path), "%s", use_tdx_shm ? TD_TDX_SHM_DEVICE : cfg->memory_file);
     pthread_mutex_init(&region->lock, NULL);
 
     if (td_region_is_owner(cfg)) {
