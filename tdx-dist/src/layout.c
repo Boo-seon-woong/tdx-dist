@@ -30,10 +30,6 @@ static int td_region_use_tdx_shm(const td_config_t *cfg) {
     return access(TD_TDX_SHM_DEVICE, R_OK | W_OK) == 0;
 }
 
-static int td_region_requires_tdx_shm(const td_config_t *cfg) {
-    return cfg->tdx == TD_TDX_ON && cfg->transport == TD_TRANSPORT_RDMA && cfg->mode == TD_MODE_MN;
-}
-
 static void td_region_initialize(td_local_region_t *region, const td_config_t *cfg) {
     td_request_ring_t *ring;
 
@@ -119,11 +115,6 @@ int td_region_open(td_local_region_t *region, const td_config_t *cfg, char *err,
 
     memset(region, 0, sizeof(*region));
     region->fd = -1;
-
-    if (td_region_requires_tdx_shm(cfg) && !use_tdx_shm) {
-        td_format_error(err, err_len, "tdx rdma mn requires %s; build and load kmod/tdx_shm.ko", TD_TDX_SHM_DEVICE);
-        return -1;
-    }
 
     if (use_tdx_shm) {
         if (td_tdx_shm_open(bytes, &region->fd, &mapped, err, err_len) != 0) {

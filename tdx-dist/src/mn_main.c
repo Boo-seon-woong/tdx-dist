@@ -56,21 +56,24 @@ static const char *td_slot_layout_mode(const td_config_t *cfg) {
 static void td_print_memory_layout(const td_config_t *cfg, const td_local_region_t *region) {
     char total_buf[32];
     char header_buf[32];
+    char ring_buf[32];
     char prime_buf[32];
     char cache_buf[32];
     char backup_buf[32];
     char used_buf[32];
     char unused_buf[32];
     size_t header_bytes = sizeof(td_region_header_t);
+    size_t ring_bytes = (size_t)region->header->request_ring_bytes;
     size_t slot_bytes = sizeof(td_slot_t);
     size_t prime_bytes = cfg->prime_slots * slot_bytes;
     size_t cache_bytes = cfg->cache_slots * slot_bytes;
     size_t backup_bytes = cfg->backup_slots * slot_bytes;
-    size_t used_bytes = header_bytes + prime_bytes + cache_bytes + backup_bytes;
+    size_t used_bytes = header_bytes + ring_bytes + prime_bytes + cache_bytes + backup_bytes;
     size_t unused_bytes = region->mapped_bytes > used_bytes ? region->mapped_bytes - used_bytes : 0;
 
     td_format_bytes(total_buf, sizeof(total_buf), region->mapped_bytes);
     td_format_bytes(header_buf, sizeof(header_buf), header_bytes);
+    td_format_bytes(ring_buf, sizeof(ring_buf), ring_bytes);
     td_format_bytes(prime_buf, sizeof(prime_buf), prime_bytes);
     td_format_bytes(cache_buf, sizeof(cache_buf), cache_bytes);
     td_format_bytes(backup_buf, sizeof(backup_buf), backup_bytes);
@@ -84,7 +87,7 @@ static void td_print_memory_layout(const td_config_t *cfg, const td_local_region
         (unsigned long long)region->mapped_bytes,
         header_buf,
         (unsigned long long)region->header->request_capacity,
-        (size_t)region->header->request_ring_bytes,
+        ring_bytes,
         cfg->prime_slots,
         prime_buf,
         cfg->cache_slots,
@@ -189,7 +192,7 @@ int main(int argc, char **argv) {
     fprintf(stdout, "tdx-dist mn node_id=%d transport=%s backing=%s bytes=%llu\n",
         cfg.node_id,
         cfg.transport == TD_TRANSPORT_RDMA ? "rdma" : "tcp",
-        cfg.memory_file,
+        region.backing_path,
         (unsigned long long)region.mapped_bytes);
     td_print_memory_layout(&cfg, &region);
     fflush(stdout);

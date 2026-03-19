@@ -70,9 +70,29 @@ static void tdx_shm_vma_close(struct vm_area_struct *vma)
 	tdx_shm_put(obj);
 }
 
+/*
+ * Fault handler: return pre-allocated decrypted pages on demand.
+ * This path is compatible with pin_user_pages() used by RDMA/ib_umem,
+ * unlike the previous VM_MIXEDMAP + vm_map_pages_zero() approach which
+ * kernel 6.14+ rejects for long-term GUP pinning.
+ */
+static vm_fault_t tdx_shm_vma_fault(struct vm_fault *vmf)
+{
+	struct tdx_shm_object *obj = vmf->vma->vm_private_data;
+	unsigned long pgoff = vmf->pgoff;
+
+	if (pgoff >= obj->npages || !obj->pages[pgoff])
+		return VM_FAULT_SIGBUS;
+
+	get_page(obj->pages[pgoff]);
+	vmf->page = obj->pages[pgoff];
+	return 0;
+}
+
 static const struct vm_operations_struct tdx_shm_vm_ops = {
 	.open = tdx_shm_vma_open,
 	.close = tdx_shm_vma_close,
+	.fault = tdx_shm_vma_fault,
 };
 
 static int tdx_shm_alloc_pages(struct tdx_shm_object *obj, unsigned long npages)
@@ -120,12 +140,16 @@ static int tdx_shm_mmap(struct file *file, struct vm_area_struct *vma)
 		return rc;
 
 	obj->size = size;
+	/*
+	 * Use a fault handler instead of VM_MIXEDMAP + vm_map_pages_zero().
+	 * Kernel 6.14 pin_user_pages() rejects pages in VM_MIXEDMAP VMAs,
+	 * which breaks ibv_reg_mr() for RDMA memory registration.
+	 *
+	 * With a fault handler, pages are populated on first access through
+	 * the standard GUP path, making them fully pinnable by RDMA.
+	 */
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
-	rc = vm_map_pages_zero(vma, obj->pages, obj->npages);
-	if (rc != 0)
-		return rc;
-
 	vma->vm_ops = &tdx_shm_vm_ops;
 	vma->vm_private_data = obj;
 	tdx_shm_vma_open(vma);

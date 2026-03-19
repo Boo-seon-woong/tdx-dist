@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
         "tdx-dist host listen=%s:%d backing=%s total=%s request_slots=%llu ring=%s slot_offset=%llu\n",
         cfg.listen_host,
         cfg.listen_port,
-        cfg.memory_file,
+        region.backing_path,
         total_buf,
         (unsigned long long)region.header->request_capacity,
         ring_buf,

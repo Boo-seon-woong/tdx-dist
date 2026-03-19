@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 typedef struct {
@@ -52,6 +53,176 @@ static int td_rdma_use_tdx_shm(td_tdx_mode_t tdx_mode) {
 static int td_rdma_mr_access(int base_access, td_tdx_mode_t tdx_mode) {
     (void)tdx_mode;
     return base_access;
+}
+
+static size_t td_rdma_page_size(void) {
+    long value = sysconf(_SC_PAGESIZE);
+
+    return value > 0 ? (size_t)value : 4096u;
+}
+
+static void td_rdma_format_memlock(char *buf, size_t buf_len) {
+    struct rlimit limit;
+
+    if (buf_len == 0) {
+        return;
+    }
+    if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0) {
+        snprintf(buf, buf_len, "unknown");
+        return;
+    }
+    if (limit.rlim_cur == RLIM_INFINITY && limit.rlim_max == RLIM_INFINITY) {
+        snprintf(buf, buf_len, "soft=unlimited hard=unlimited");
+        return;
+    }
+    if (limit.rlim_cur == RLIM_INFINITY) {
+        snprintf(buf, buf_len, "soft=unlimited hard=%llu", (unsigned long long)limit.rlim_max);
+        return;
+    }
+    if (limit.rlim_max == RLIM_INFINITY) {
+        snprintf(buf, buf_len, "soft=%llu hard=unlimited", (unsigned long long)limit.rlim_cur);
+        return;
+    }
+    snprintf(buf, buf_len, "soft=%llu hard=%llu",
+        (unsigned long long)limit.rlim_cur,
+        (unsigned long long)limit.rlim_max);
+}
+
+static void td_rdma_format_mapping(const void *addr, char *buf, size_t buf_len) {
+    FILE *maps = NULL;
+    unsigned long long target = (unsigned long long)(uintptr_t)addr;
+    char line[256];
+
+    if (buf_len == 0) {
+        return;
+    }
+
+    maps = fopen("/proc/self/maps", "r");
+    if (maps == NULL) {
+        snprintf(buf, buf_len, "unavailable");
+        return;
+    }
+
+    while (fgets(line, sizeof(line), maps) != NULL) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        char *newline;
+
+        if (sscanf(line, "%llx-%llx", &start, &end) != 2) {
+            continue;
+        }
+        if (target < start || target >= end) {
+            continue;
+        }
+        newline = strchr(line, '\n');
+        if (newline != NULL) {
+            *newline = '\0';
+        }
+        snprintf(buf, buf_len, "%s", line);
+        fclose(maps);
+        return;
+    }
+
+    fclose(maps);
+    snprintf(buf, buf_len, "not-found");
+}
+
+static int td_rdma_try_reg_mr(struct ibv_pd *pd, void *base, size_t bytes, int access, int *saved_errno) {
+    struct ibv_mr *mr;
+
+    if (saved_errno != NULL) {
+        *saved_errno = 0;
+    }
+    if (bytes == 0) {
+        return 0;
+    }
+
+    errno = 0;
+    mr = ibv_reg_mr(pd, base, bytes, access);
+    if (mr == NULL) {
+        if (saved_errno != NULL) {
+            *saved_errno = errno;
+        }
+        return -1;
+    }
+
+    ibv_dereg_mr(mr);
+    return 0;
+}
+
+static int td_rdma_probe_anon_mr(struct ibv_pd *pd, int access, int *saved_errno) {
+    size_t bytes = td_rdma_page_size();
+    void *base;
+    int rc;
+
+    base = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        if (saved_errno != NULL) {
+            *saved_errno = errno;
+        }
+        return -1;
+    }
+
+    memset(base, 0, bytes);
+    rc = td_rdma_try_reg_mr(pd, base, bytes, access, saved_errno);
+    munmap(base, bytes);
+    return rc;
+}
+
+static const char *td_rdma_probe_result(int rc, int saved_errno, char *buf, size_t buf_len) {
+    if (rc == 0) {
+        snprintf(buf, buf_len, "ok");
+    } else if (saved_errno != 0) {
+        snprintf(buf, buf_len, "fail(errno=%d:%s)", saved_errno, strerror(saved_errno));
+    } else {
+        snprintf(buf, buf_len, "fail(errno=0)");
+    }
+    return buf;
+}
+
+static void td_rdma_log_mr_failure(struct ibv_pd *pd, td_local_region_t *region, int access, int reg_errno) {
+    char memlock_buf[64];
+    char mapping_buf[256];
+    char region_probe_buf[64];
+    char anon_probe_buf[64];
+    size_t probe_bytes = region->mapped_bytes < td_rdma_page_size() ? region->mapped_bytes : td_rdma_page_size();
+    int region_probe_errno = 0;
+    int anon_probe_errno = 0;
+    int region_probe_rc;
+    int anon_probe_rc;
+
+    td_rdma_format_memlock(memlock_buf, sizeof(memlock_buf));
+    td_rdma_format_mapping(region->base, mapping_buf, sizeof(mapping_buf));
+    region_probe_rc = td_rdma_try_reg_mr(pd, region->base, probe_bytes, access, &region_probe_errno);
+    anon_probe_rc = td_rdma_probe_anon_mr(pd, access, &anon_probe_errno);
+
+    fprintf(stderr,
+        "rdma host mr debug base=%p len=%zu access=0x%x backing=%s errno=%d(%s) memlock=%s\n",
+        region->base,
+        region->mapped_bytes,
+        access,
+        region->backing_path,
+        reg_errno,
+        strerror(reg_errno != 0 ? reg_errno : EIO),
+        memlock_buf);
+    fprintf(stderr, "rdma host mr debug map=%s\n", mapping_buf);
+    fprintf(stderr,
+        "rdma host mr debug probe region_%zu=%s anon_%zu=%s\n",
+        probe_bytes,
+        td_rdma_probe_result(region_probe_rc, region_probe_errno, region_probe_buf, sizeof(region_probe_buf)),
+        td_rdma_page_size(),
+        td_rdma_probe_result(anon_probe_rc, anon_probe_errno, anon_probe_buf, sizeof(anon_probe_buf)));
+
+    if (strcmp(region->backing_path, TD_TDX_SHM_DEVICE) == 0 && region_probe_rc != 0 && anon_probe_rc == 0) {
+        fprintf(stderr,
+            "rdma host mr diagnosis: %s mapping is user-visible but not pinnable by ibv_reg_mr; inspect tdx_shm VMA flags and GUP compatibility in the TDX VFIO path\n",
+            TD_TDX_SHM_DEVICE);
+    } else if (region_probe_rc == 0) {
+        fprintf(stderr,
+            "rdma host mr diagnosis: a one-page probe registers, so the full %zu-byte MR is likely hitting a size or pin-limit constraint\n",
+            region->mapped_bytes);
+    }
+    fflush(stderr);
 }
 
 static uint64_t td_rdma_profile_begin(td_session_t *session) {
@@ -534,6 +705,7 @@ static int td_rdma_host_setup_conn(
     char *err,
     size_t err_len) {
     struct ibv_qp_init_attr qp_attr;
+    int access;
 
     conn->pd = ibv_alloc_pd(conn->id->verbs);
     conn->cq = ibv_create_cq(conn->id->verbs, 128, NULL, NULL, 0);
@@ -556,15 +728,19 @@ static int td_rdma_host_setup_conn(
         return -1;
     }
 
+    access = td_rdma_mr_access(
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC,
+        cfg->tdx);
     conn->region_mr = ibv_reg_mr(
         conn->pd,
         region->base,
         region->mapped_bytes,
-        td_rdma_mr_access(
-            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC,
-            cfg->tdx));
+        access);
     if (conn->region_mr == NULL) {
-        td_format_error(err, err_len, "rdma host ibv_reg_mr failed");
+        int reg_errno = errno;
+
+        td_rdma_log_mr_failure(conn->pd, region, access, reg_errno);
+        td_format_error(err, err_len, "rdma host ibv_reg_mr failed: %s", strerror(reg_errno != 0 ? reg_errno : EIO));
         return -1;
     }
     return 0;
