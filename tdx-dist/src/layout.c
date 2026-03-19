@@ -30,6 +30,46 @@ static int td_region_use_tdx_shm(const td_config_t *cfg) {
     return access(TD_TDX_SHM_DEVICE, R_OK | W_OK) == 0;
 }
 
+static int td_region_needs_dma_flush(const td_local_region_t *region) {
+    return region != NULL && strcmp(region->backing_path, TD_TDX_SHM_DEVICE) == 0;
+}
+
+void td_region_flush_ptr(td_local_region_t *region, const void *ptr, size_t len) {
+#if defined(__x86_64__) || defined(__i386__)
+    uintptr_t region_base;
+    uintptr_t region_end;
+    uintptr_t start;
+    uintptr_t end;
+    uintptr_t cursor;
+    const size_t cacheline_bytes = 64u;
+
+    if (!td_region_needs_dma_flush(region) || ptr == NULL || len == 0) {
+        return;
+    }
+
+    region_base = (uintptr_t)region->base;
+    region_end = region_base + region->mapped_bytes;
+    start = (uintptr_t)ptr;
+    end = start + len;
+    if (start < region_base || end < start || end > region_end) {
+        return;
+    }
+
+    start &= ~((uintptr_t)cacheline_bytes - 1u);
+    end = (end + cacheline_bytes - 1u) & ~((uintptr_t)cacheline_bytes - 1u);
+
+    __sync_synchronize();
+    for (cursor = start; cursor < end; cursor += cacheline_bytes) {
+        __asm__ volatile("clflush (%0)" : : "r"((const void *)cursor) : "memory");
+    }
+    __sync_synchronize();
+#else
+    (void)region;
+    (void)ptr;
+    (void)len;
+#endif
+}
+
 static void td_region_initialize(td_local_region_t *region, const td_config_t *cfg) {
     td_request_ring_t *ring;
 
@@ -228,6 +268,7 @@ int td_region_write_bytes(td_local_region_t *region, size_t offset, const void *
     }
     pthread_mutex_lock(&region->lock);
     memcpy((unsigned char *)region->base + offset, buf, len);
+    td_region_flush_ptr(region, (unsigned char *)region->base + offset, len);
     pthread_mutex_unlock(&region->lock);
     return 0;
 }
@@ -245,6 +286,7 @@ int td_region_cas64(td_local_region_t *region, size_t offset, uint64_t compare, 
     observed = *ptr;
     if (observed == compare) {
         *ptr = swap;
+        td_region_flush_ptr(region, ptr, sizeof(*ptr));
     }
     pthread_mutex_unlock(&region->lock);
 
@@ -266,6 +308,7 @@ size_t td_region_count_cache_usage(td_local_region_t *region) {
         }
     }
     region->header->cache_usage = used;
+    td_region_flush_ptr(region, &region->header->cache_usage, sizeof(region->header->cache_usage));
     pthread_mutex_unlock(&region->lock);
     return used;
 }
@@ -295,10 +338,12 @@ void td_region_evict_if_needed(td_local_region_t *region, size_t threshold_pct) 
         td_slot_t *slot = td_region_slot_ptr(region, TD_REGION_CACHE, idx);
         if ((slot->flags & TD_SLOT_FLAG_VALID) != 0) {
             memset(slot, 0, sizeof(*slot));
+            td_region_flush_ptr(region, slot, sizeof(*slot));
             --target;
         }
         region->header->eviction_cursor = (region->header->eviction_cursor + 1) % region->header->cache_slot_count;
     }
+    td_region_flush_ptr(region, &region->header->eviction_cursor, sizeof(region->header->eviction_cursor));
     pthread_mutex_unlock(&region->lock);
     td_region_count_cache_usage(region);
 }

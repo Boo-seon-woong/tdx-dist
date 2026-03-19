@@ -1,9 +1,20 @@
 #include "td_request.h"
 
 #include <sched.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <string.h>
+
+#define TD_REQUEST_WAIT_DIAG_NS 1000000000ULL
+#define TD_REQUEST_WAIT_TIMEOUT_NS 5000000000ULL
+
+typedef struct {
+    uint64_t reserve_head;
+    uint64_t head;
+    uint64_t tail;
+    int valid;
+} td_request_ring_diag_t;
 
 static td_request_entry_t *td_local_request_entry(td_local_region_t *region, uint64_t seq) {
     return (td_request_entry_t *)((unsigned char *)region->base + td_request_ring_entry_offset(region->header, seq));
@@ -11,6 +22,19 @@ static td_request_entry_t *td_local_request_entry(td_local_region_t *region, uin
 
 static int td_remote_read_u64(td_session_t *session, size_t offset, uint64_t *value, char *err, size_t err_len) {
     return session->read_region(session, offset, value, sizeof(*value), err, err_len);
+}
+
+static void td_remote_read_ring_diag(td_session_t *session, td_request_ring_diag_t *diag) {
+    char scratch[128];
+    size_t ring_offset = (size_t)session->header.request_ring_offset;
+
+    memset(diag, 0, sizeof(*diag));
+    if (td_remote_read_u64(session, ring_offset + offsetof(td_request_ring_t, reserve_head), &diag->reserve_head, scratch, sizeof(scratch)) != 0 ||
+        td_remote_read_u64(session, ring_offset + offsetof(td_request_ring_t, head), &diag->head, scratch, sizeof(scratch)) != 0 ||
+        td_remote_read_u64(session, ring_offset + offsetof(td_request_ring_t, tail), &diag->tail, scratch, sizeof(scratch)) != 0) {
+        return;
+    }
+    diag->valid = 1;
 }
 
 static int td_remote_reserve_seq(td_session_t *session, uint64_t *seq_out, char *err, size_t err_len) {
@@ -64,9 +88,12 @@ static int td_remote_publish_seq(td_session_t *session, uint64_t seq, char *err,
 
 static int td_remote_submit_request(td_session_t *session, td_request_entry_t *request, td_request_result_t *result, char *err, size_t err_len) {
     td_request_entry_t observed;
+    td_request_ring_diag_t diag;
     size_t entry_offset;
     uint64_t seq;
     uint64_t start_ns;
+    uint64_t next_diag_ns;
+    uint64_t deadline_ns;
 
     start_ns = session->transport_profile != NULL ? td_now_ns() : 0;
     if (td_remote_reserve_seq(session, &seq, err, err_len) != 0) {
@@ -99,7 +126,11 @@ static int td_remote_submit_request(td_session_t *session, td_request_entry_t *r
     }
 
     start_ns = session->transport_profile != NULL ? td_now_ns() : 0;
+    next_diag_ns = td_now_ns() + TD_REQUEST_WAIT_DIAG_NS;
+    deadline_ns = td_now_ns() + TD_REQUEST_WAIT_TIMEOUT_NS;
     for (;;) {
+        uint64_t now_ns;
+
         if (session->read_region(session, entry_offset, &observed, sizeof(observed), err, err_len) != 0) {
             return -1;
         }
@@ -109,6 +140,56 @@ static int td_remote_submit_request(td_session_t *session, td_request_entry_t *r
         }
         if (observed.state == TD_REQ_STATE_DONE) {
             break;
+        }
+        now_ns = td_now_ns();
+        if (now_ns >= next_diag_ns) {
+            td_remote_read_ring_diag(session, &diag);
+            if (diag.valid) {
+                fprintf(stderr,
+                    "tdx-dist cn request wait seq=%llu state=%u status=%u observed_epoch=%llu ring_head=%llu reserve_head=%llu tail=%llu\n",
+                    (unsigned long long)seq,
+                    observed.state,
+                    observed.status,
+                    (unsigned long long)observed.observed_epoch,
+                    (unsigned long long)diag.head,
+                    (unsigned long long)diag.reserve_head,
+                    (unsigned long long)diag.tail);
+            } else {
+                fprintf(stderr,
+                    "tdx-dist cn request wait seq=%llu state=%u status=%u observed_epoch=%llu ring=unavailable\n",
+                    (unsigned long long)seq,
+                    observed.state,
+                    observed.status,
+                    (unsigned long long)observed.observed_epoch);
+            }
+            fflush(stderr);
+            next_diag_ns = now_ns + TD_REQUEST_WAIT_DIAG_NS;
+        }
+        if (now_ns >= deadline_ns) {
+            td_remote_read_ring_diag(session, &diag);
+            if (diag.valid) {
+                td_format_error(
+                    err,
+                    err_len,
+                    "request completion timeout seq=%llu state=%u status=%u observed_epoch=%llu ring_head=%llu reserve_head=%llu tail=%llu",
+                    (unsigned long long)seq,
+                    observed.state,
+                    observed.status,
+                    (unsigned long long)observed.observed_epoch,
+                    (unsigned long long)diag.head,
+                    (unsigned long long)diag.reserve_head,
+                    (unsigned long long)diag.tail);
+            } else {
+                td_format_error(
+                    err,
+                    err_len,
+                    "request completion timeout seq=%llu state=%u status=%u observed_epoch=%llu",
+                    (unsigned long long)seq,
+                    observed.state,
+                    observed.status,
+                    (unsigned long long)observed.observed_epoch);
+            }
+            return -1;
         }
         sched_yield();
     }
@@ -150,6 +231,7 @@ static int td_local_commit_slot(
             sizeof(td_slot_t) - offsetof(td_slot_t, visible_epoch));
         atomic_thread_fence(memory_order_release);
         slot->guard_epoch = proposal->visible_epoch;
+        td_region_flush_ptr(region, slot, sizeof(*slot));
         *observed_epoch = compare_epoch;
         *observed_tie_breaker = proposal->tie_breaker;
         rc = 0;
@@ -237,5 +319,7 @@ int td_request_consume_once(td_local_region_t *region, size_t eviction_threshold
     atomic_thread_fence(memory_order_release);
     __atomic_store_n(&entry->state, TD_REQ_STATE_DONE, __ATOMIC_RELEASE);
     __atomic_store_n(&ring->tail, tail + 1, __ATOMIC_RELEASE);
+    td_region_flush_ptr(region, entry, sizeof(*entry));
+    td_region_flush_ptr(region, ring, sizeof(*ring));
     return 1;
 }
