@@ -62,12 +62,10 @@ typedef struct {
 #define TD_RDMA_MSG_BUF_BYTES 4096u
 #define TD_RDMA_WRID_SEND 1ULL
 #define TD_RDMA_WRID_RECV 2ULL
+#define TD_RDMA_MSG_WAIT_DIAG_NS 1000000000ULL
+#define TD_RDMA_MSG_WAIT_TIMEOUT_NS 5000000000ULL
 
 int td_tcp_client_connect(td_session_t *session, const td_endpoint_t *endpoint, char *err, size_t err_len);
-
-static int td_rdma_use_tdx_shm(td_tdx_mode_t tdx_mode) {
-    return tdx_mode == TD_TDX_ON && access(TD_TDX_SHM_DEVICE, R_OK | W_OK) == 0;
-}
 
 static int td_rdma_mr_access(int base_access, td_tdx_mode_t tdx_mode) {
     (void)tdx_mode;
@@ -423,7 +421,6 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, size_t op_buf_len, td_tdx_mo
     size_t send_bytes = op_buf_len > TD_RDMA_MSG_BUF_BYTES ? op_buf_len : TD_RDMA_MSG_BUF_BYTES;
     size_t cas_offset = (send_bytes + (sizeof(uint64_t) - 1)) & ~(sizeof(uint64_t) - 1);
     size_t recv_offset = (cas_offset + sizeof(uint64_t) + (sizeof(uint64_t) - 1)) & ~(sizeof(uint64_t) - 1);
-    char alloc_err[128];
 
     impl->pd = ibv_alloc_pd(impl->id->verbs);
     impl->cq = ibv_create_cq(impl->id->verbs, 128, NULL, NULL, 0);
@@ -450,18 +447,16 @@ static int td_rdma_setup_impl(td_rdma_impl_t *impl, size_t op_buf_len, td_tdx_mo
     impl->workbuf_len = recv_offset + TD_RDMA_MSG_BUF_BYTES;
     impl->op_buf_len = send_bytes;
     impl->recv_buf_len = TD_RDMA_MSG_BUF_BYTES;
-    if (td_rdma_use_tdx_shm(tdx_mode)) {
-        if (td_tdx_shm_open(impl->workbuf_len, &impl->workbuf_fd, &impl->workbuf_base, alloc_err, sizeof(alloc_err)) != 0) {
-            td_format_error(err, err_len, "rdma shared buffer allocation failed: %s", alloc_err);
-            return -1;
-        }
-        impl->use_tdx_shm = 1;
-    } else {
-        impl->workbuf_base = calloc(1, impl->workbuf_len);
-        if (impl->workbuf_base == NULL) {
-            td_format_error(err, err_len, "rdma buffer allocation failed");
-            return -1;
-        }
+    /*
+     * Keep transport work buffers in ordinary anonymous memory.
+     * In TDX guests, these buffers only need to be MR-pinnable for SEND/RECV
+     * or local RDMA staging; backing them with /dev/tdx_shm adds pressure to
+     * the decrypted-memory path without helping the transport itself.
+     */
+    impl->workbuf_base = calloc(1, impl->workbuf_len);
+    if (impl->workbuf_base == NULL) {
+        td_format_error(err, err_len, "rdma buffer allocation failed");
+        return -1;
     }
     impl->op_buf = (unsigned char *)impl->workbuf_base;
     impl->cas_buf = (uint64_t *)((unsigned char *)impl->workbuf_base + cas_offset);
@@ -661,6 +656,10 @@ static int td_rdma_client_msg_exchange(
     size_t max_send_payload = impl->op_buf_len > sizeof(*request) ? impl->op_buf_len - sizeof(*request) : 0;
     size_t max_recv_payload = impl->recv_buf_len > sizeof(*response) ? impl->recv_buf_len - sizeof(*response) : 0;
     size_t recv_bytes = 0;
+    uint64_t next_diag_ns = td_now_ns() + TD_RDMA_MSG_WAIT_DIAG_NS;
+    uint64_t deadline_ns = td_now_ns() + TD_RDMA_MSG_WAIT_TIMEOUT_NS;
+    unsigned int last_opcode = 0;
+    uint64_t last_wr_id = 0;
     int send_done = 0;
     int recv_done = 0;
 
@@ -682,17 +681,41 @@ static int td_rdma_client_msg_exchange(
     }
 
     while (!(send_done && recv_done)) {
+        uint64_t now_ns;
+
         if (td_rdma_poll_wc_on_cq(impl->cq, &wc, NULL, err, err_len) != 0) {
             return -1;
         }
+        last_opcode = (unsigned int)wc.opcode;
+        last_wr_id = wc.wr_id;
         if (wc.wr_id == TD_RDMA_WRID_SEND && wc.opcode == IBV_WC_SEND) {
             send_done = 1;
-            continue;
-        }
-        if (wc.wr_id == TD_RDMA_WRID_RECV && wc.opcode == IBV_WC_RECV) {
+        } else if (wc.wr_id == TD_RDMA_WRID_RECV && wc.opcode == IBV_WC_RECV) {
             recv_bytes = (size_t)wc.byte_len;
             recv_done = 1;
-            continue;
+        }
+
+        now_ns = td_now_ns();
+        if (now_ns >= next_diag_ns) {
+            fprintf(stderr,
+                "tdx-dist cn rdma msg wait send_done=%d recv_done=%d last_opcode=%u last_wr_id=%llu\n",
+                send_done,
+                recv_done,
+                last_opcode,
+                (unsigned long long)last_wr_id);
+            fflush(stderr);
+            next_diag_ns = now_ns + TD_RDMA_MSG_WAIT_DIAG_NS;
+        }
+        if (now_ns >= deadline_ns) {
+            td_format_error(
+                err,
+                err_len,
+                "rdma message timeout send_done=%d recv_done=%d last_opcode=%u last_wr_id=%llu",
+                send_done,
+                recv_done,
+                last_opcode,
+                (unsigned long long)last_wr_id);
+            return -1;
         }
     }
 
@@ -925,6 +948,13 @@ static int td_rdma_client_connect(td_session_t *session, const td_config_t *cfg,
         session->control = td_rdma_client_control;
     }
     session->close = td_rdma_client_close;
+    fprintf(stdout,
+        "tdx-dist cn rdma mode=%s node_id=%d remote_addr=0x%llx rkey=%u\n",
+        (info.reserved & TD_RDMA_CONNECT_FLAG_MSG) != 0 ? "msg" : "onesided",
+        endpoint->node_id,
+        (unsigned long long)session->remote_addr,
+        session->rkey);
+    fflush(stdout);
     return 0;
 }
 
@@ -964,23 +994,15 @@ static void td_rdma_destroy_host_conn(td_rdma_host_conn_t *conn) {
 }
 
 static int td_rdma_host_setup_msg_buffers(td_rdma_host_conn_t *conn, td_tdx_mode_t tdx_mode, char *err, size_t err_len) {
-    char alloc_err[128];
+    (void)tdx_mode;
 
     conn->workbuf_fd = -1;
     conn->workbuf_len = TD_RDMA_MSG_BUF_BYTES * 2u;
     conn->msg_buf_len = TD_RDMA_MSG_BUF_BYTES;
-    if (td_rdma_use_tdx_shm(tdx_mode)) {
-        if (td_tdx_shm_open(conn->workbuf_len, &conn->workbuf_fd, &conn->workbuf_base, alloc_err, sizeof(alloc_err)) != 0) {
-            td_format_error(err, err_len, "rdma host message buffer allocation failed: %s", alloc_err);
-            return -1;
-        }
-        conn->use_tdx_shm = 1;
-    } else {
-        conn->workbuf_base = calloc(1, conn->workbuf_len);
-        if (conn->workbuf_base == NULL) {
-            td_format_error(err, err_len, "rdma host message buffer allocation failed");
-            return -1;
-        }
+    conn->workbuf_base = calloc(1, conn->workbuf_len);
+    if (conn->workbuf_base == NULL) {
+        td_format_error(err, err_len, "rdma host message buffer allocation failed");
+        return -1;
     }
 
     conn->recv_buf = (unsigned char *)conn->workbuf_base;
@@ -1018,6 +1040,8 @@ static int td_rdma_host_handle_msg_request(td_rdma_host_conn_t *conn, size_t req
     response->magic = TD_WIRE_MAGIC;
     response->op = TD_WIRE_ACK;
     response->flags = request->flags;
+    fprintf(stdout, "tdx-dist mn rdma msg op=%u len=%llu\n", request->op, (unsigned long long)request->length);
+    fflush(stdout);
 
     switch (request->op) {
         case TD_WIRE_HELLO:
@@ -1252,6 +1276,12 @@ int td_rdma_host_run(const td_config_t *cfg, td_local_region_t *region, volatile
                             fflush(stderr);
                             dispose_conn = conn;
                         } else {
+                            fprintf(stdout,
+                                "tdx-dist mn rdma accept mode=%s remote_addr=0x%llx rkey=%u\n",
+                                conn->msg_mode ? "msg" : "onesided",
+                                (unsigned long long)info.remote_addr,
+                                info.rkey);
+                            fflush(stdout);
                             conn->next = connections;
                             connections = conn;
                             conn = NULL;
