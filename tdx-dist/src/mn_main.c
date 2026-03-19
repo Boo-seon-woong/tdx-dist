@@ -13,6 +13,14 @@ typedef struct {
     size_t threshold_pct;
 } td_eviction_ctx_t;
 
+typedef struct {
+    const td_config_t *cfg;
+    td_local_region_t *region;
+    volatile sig_atomic_t *stop_flag;
+    char err[256];
+    int rc;
+} td_rdma_host_ctx_t;
+
 static void td_format_bytes(char *buf, size_t buf_len, size_t bytes) {
     const unsigned long long gb = 1024ULL * 1024ULL * 1024ULL;
     const unsigned long long mb = 1024ULL * 1024ULL;
@@ -127,13 +135,22 @@ static void *td_eviction_thread(void *arg) {
     return NULL;
 }
 
+static void *td_rdma_host_thread(void *arg) {
+    td_rdma_host_ctx_t *ctx = (td_rdma_host_ctx_t *)arg;
+    ctx->rc = td_rdma_host_run(ctx->cfg, ctx->region, ctx->stop_flag, ctx->err, sizeof(ctx->err));
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     const char *config_path = NULL;
     td_config_t cfg;
     td_local_region_t region;
     td_eviction_ctx_t eviction_ctx;
+    td_rdma_host_ctx_t rdma_host_ctx;
     char err[256];
     pthread_t evict_thread;
+    pthread_t rdma_host_thread_id;
+    int have_rdma_host_thread = 0;
     int rc;
 
     if (td_find_config(argc, argv, &config_path) != 0) {
@@ -159,6 +176,16 @@ int main(int argc, char **argv) {
     eviction_ctx.threshold_pct = cfg.eviction_threshold_pct;
     pthread_create(&evict_thread, NULL, td_eviction_thread, &eviction_ctx);
 
+    if (cfg.transport == TD_TRANSPORT_RDMA) {
+        memset(&rdma_host_ctx, 0, sizeof(rdma_host_ctx));
+        rdma_host_ctx.cfg = &cfg;
+        rdma_host_ctx.region = &region;
+        rdma_host_ctx.stop_flag = &td_stop;
+        pthread_create(&rdma_host_thread_id, NULL, td_rdma_host_thread, &rdma_host_ctx);
+        have_rdma_host_thread = 1;
+        fprintf(stdout, "tdx-dist mn rdma endpoint %s:%d started\n", cfg.listen_host, cfg.listen_port);
+    }
+
     fprintf(stdout, "tdx-dist mn node_id=%d transport=%s backing=%s bytes=%llu\n",
         cfg.node_id,
         cfg.transport == TD_TRANSPORT_RDMA ? "rdma" : "tcp",
@@ -174,6 +201,15 @@ int main(int argc, char **argv) {
     }
 
     td_stop = 1;
+    if (have_rdma_host_thread) {
+        pthread_join(rdma_host_thread_id, NULL);
+        if (rdma_host_ctx.rc != 0) {
+            fprintf(stderr, "rdma host error: %s\n", rdma_host_ctx.err);
+            if (rc == 0) {
+                rc = rdma_host_ctx.rc;
+            }
+        }
+    }
     pthread_join(evict_thread, NULL);
     td_region_close(&region);
 

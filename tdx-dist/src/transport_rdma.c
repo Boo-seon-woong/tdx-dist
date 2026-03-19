@@ -665,11 +665,7 @@ int td_rdma_host_run(const td_config_t *cfg, td_local_region_t *region, volatile
 }
 
 int td_rdma_server_run(const td_config_t *cfg, td_local_region_t *region, volatile sig_atomic_t *stop_flag, char *err, size_t err_len) {
-    (void)cfg;
-    (void)region;
-    (void)stop_flag;
-    td_format_error(err, err_len, "tdx-dist mn no longer runs an rdma server; start bin/host instead");
-    return -1;
+    return td_rdma_host_run(cfg, region, stop_flag, err, err_len);
 }
 
 int td_session_connect(td_session_t *session, const td_config_t *cfg, const td_endpoint_t *endpoint, char *err, size_t err_len) {

@@ -444,8 +444,8 @@ int td_config_load(const char *path, td_config_t *cfg, char *err, size_t err_len
         td_format_error(err, err_len, "memory_file must be set");
         return -1;
     }
-    if (cfg->mode == TD_MODE_MN && cfg->transport == TD_TRANSPORT_TCP && cfg->listen_port <= 0) {
-        td_format_error(err, err_len, "tcp mn config requires listen_port");
+    if (cfg->mode == TD_MODE_MN && cfg->listen_port <= 0) {
+        td_format_error(err, err_len, "mn config requires listen_port");
         return -1;
     }
     return 0;
