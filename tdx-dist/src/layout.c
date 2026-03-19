@@ -34,7 +34,7 @@ static int td_region_needs_dma_flush(const td_local_region_t *region) {
     return region != NULL && strcmp(region->backing_path, TD_TDX_SHM_DEVICE) == 0;
 }
 
-void td_region_flush_ptr(td_local_region_t *region, const void *ptr, size_t len) {
+static void td_region_clflush_ptr(td_local_region_t *region, const void *ptr, size_t len) {
 #if defined(__x86_64__) || defined(__i386__)
     uintptr_t region_base;
     uintptr_t region_end;
@@ -68,6 +68,14 @@ void td_region_flush_ptr(td_local_region_t *region, const void *ptr, size_t len)
     (void)ptr;
     (void)len;
 #endif
+}
+
+void td_region_flush_ptr(td_local_region_t *region, const void *ptr, size_t len) {
+    td_region_clflush_ptr(region, ptr, len);
+}
+
+void td_region_invalidate_ptr(td_local_region_t *region, const void *ptr, size_t len) {
+    td_region_clflush_ptr(region, ptr, len);
 }
 
 static void td_region_initialize(td_local_region_t *region, const td_config_t *cfg) {

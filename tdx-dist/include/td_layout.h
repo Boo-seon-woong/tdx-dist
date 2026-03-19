@@ -72,6 +72,7 @@ int td_region_read_bytes(td_local_region_t *region, size_t offset, void *buf, si
 int td_region_write_bytes(td_local_region_t *region, size_t offset, const void *buf, size_t len);
 int td_region_cas64(td_local_region_t *region, size_t offset, uint64_t compare, uint64_t swap, uint64_t *old_value);
 void td_region_flush_ptr(td_local_region_t *region, const void *ptr, size_t len);
+void td_region_invalidate_ptr(td_local_region_t *region, const void *ptr, size_t len);
 
 size_t td_region_count_cache_usage(td_local_region_t *region);
 void td_region_evict_if_needed(td_local_region_t *region, size_t threshold_pct);

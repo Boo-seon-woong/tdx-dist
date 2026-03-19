@@ -280,16 +280,20 @@ int td_remote_evict_request(td_session_t *session, td_request_result_t *result, 
 
 int td_request_consume_once(td_local_region_t *region, size_t eviction_threshold_pct, char *err, size_t err_len) {
     td_request_ring_t *ring = td_region_request_ring_ptr(region);
-    uint64_t tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
-    uint64_t head = __atomic_load_n(&ring->head, __ATOMIC_ACQUIRE);
+    uint64_t tail;
+    uint64_t head;
     td_request_entry_t *entry;
     int rc = 0;
 
+    td_region_invalidate_ptr(region, ring, sizeof(*ring));
+    tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
+    head = __atomic_load_n(&ring->head, __ATOMIC_ACQUIRE);
     if (tail >= head) {
         return 0;
     }
 
     entry = td_local_request_entry(region, tail);
+    td_region_invalidate_ptr(region, entry, sizeof(*entry));
     if (__atomic_load_n(&entry->state, __ATOMIC_ACQUIRE) != TD_REQ_STATE_READY || entry->seq != tail) {
         return 0;
     }

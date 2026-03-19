@@ -128,6 +128,7 @@ static int td_request_server_run(td_local_region_t *region, volatile sig_atomic_
         }
         if (++diag_counter % 50000 == 0) {
             td_request_ring_t *ring = td_region_request_ring_ptr(region);
+            td_region_invalidate_ptr(region, ring, sizeof(*ring));
             fprintf(stdout, "tdx-dist mn ring diag: head=%llu reserve_head=%llu tail=%llu cap=%llu (iter=%lu)\n",
                 (unsigned long long)ring->head,
                 (unsigned long long)ring->reserve_head,
