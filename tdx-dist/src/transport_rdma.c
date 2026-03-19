@@ -49,6 +49,7 @@ typedef struct td_rdma_host_conn {
     td_local_region_t *region;
     size_t eviction_threshold_pct;
     int msg_mode;
+    uint64_t next_wait_diag_ns;
     struct td_rdma_host_conn *next;
 } td_rdma_host_conn_t;
 
@@ -311,6 +312,27 @@ static int td_rdma_poll_wc_on_cq(
         }
         return 0;
     }
+}
+
+static int td_rdma_poll_wc_try_once(
+    struct ibv_cq *cq,
+    struct ibv_wc *wc_out,
+    char *err,
+    size_t err_len) {
+    int n = ibv_poll_cq(cq, 1, wc_out);
+
+    if (n < 0) {
+        td_format_error(err, err_len, "rdma poll cq failed");
+        return -1;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    if (wc_out->status != IBV_WC_SUCCESS) {
+        td_format_error(err, err_len, "rdma completion failed status=%d", wc_out->status);
+        return -1;
+    }
+    return 1;
 }
 
 static int td_rdma_poll_wc(
@@ -682,17 +704,20 @@ static int td_rdma_client_msg_exchange(
 
     while (!(send_done && recv_done)) {
         uint64_t now_ns;
+        int poll_rc = td_rdma_poll_wc_try_once(impl->cq, &wc, err, err_len);
 
-        if (td_rdma_poll_wc_on_cq(impl->cq, &wc, NULL, err, err_len) != 0) {
+        if (poll_rc < 0) {
             return -1;
         }
-        last_opcode = (unsigned int)wc.opcode;
-        last_wr_id = wc.wr_id;
-        if (wc.wr_id == TD_RDMA_WRID_SEND && wc.opcode == IBV_WC_SEND) {
-            send_done = 1;
-        } else if (wc.wr_id == TD_RDMA_WRID_RECV && wc.opcode == IBV_WC_RECV) {
-            recv_bytes = (size_t)wc.byte_len;
-            recv_done = 1;
+        if (poll_rc > 0) {
+            last_opcode = (unsigned int)wc.opcode;
+            last_wr_id = wc.wr_id;
+            if (wc.wr_id == TD_RDMA_WRID_SEND && wc.opcode == IBV_WC_SEND) {
+                send_done = 1;
+            } else if (wc.wr_id == TD_RDMA_WRID_RECV && wc.opcode == IBV_WC_RECV) {
+                recv_bytes = (size_t)wc.byte_len;
+                recv_done = 1;
+            }
         }
 
         now_ns = td_now_ns();
@@ -716,6 +741,9 @@ static int td_rdma_client_msg_exchange(
                 last_opcode,
                 (unsigned long long)last_wr_id);
             return -1;
+        }
+        if (poll_rc == 0) {
+            sched_yield();
         }
     }
 
@@ -751,7 +779,10 @@ static int td_rdma_client_msg_read(td_session_t *session, size_t offset, void *b
     request.flags = session->transport_profile != NULL ? TD_WIRE_FLAG_PROFILE : 0;
 
     start_ns = td_rdma_profile_begin(session);
-    if (td_rdma_client_msg_exchange(session, &request, NULL, &response, buf, err, err_len) != 0 || response.status != 0) {
+    if (td_rdma_client_msg_exchange(session, &request, NULL, &response, buf, err, err_len) != 0) {
+        return -1;
+    }
+    if (response.status != 0) {
         td_format_error(err, err_len, "rdma read failed for node %d", session->endpoint.node_id);
         return -1;
     }
@@ -772,7 +803,10 @@ static int td_rdma_client_msg_write(td_session_t *session, size_t offset, const 
     request.flags = session->transport_profile != NULL ? TD_WIRE_FLAG_PROFILE : 0;
 
     start_ns = td_rdma_profile_begin(session);
-    if (td_rdma_client_msg_exchange(session, &request, buf, &response, NULL, err, err_len) != 0 || response.status != 0) {
+    if (td_rdma_client_msg_exchange(session, &request, buf, &response, NULL, err, err_len) != 0) {
+        return -1;
+    }
+    if (response.status != 0) {
         td_format_error(err, err_len, "rdma write failed for node %d", session->endpoint.node_id);
         return -1;
     }
@@ -794,7 +828,10 @@ static int td_rdma_client_msg_cas(td_session_t *session, size_t offset, uint64_t
     request.flags = session->transport_profile != NULL ? TD_WIRE_FLAG_PROFILE : 0;
 
     start_ns = td_rdma_profile_begin(session);
-    if (td_rdma_client_msg_exchange(session, &request, NULL, &response, NULL, err, err_len) != 0 || response.status != 0) {
+    if (td_rdma_client_msg_exchange(session, &request, NULL, &response, NULL, err, err_len) != 0) {
+        return -1;
+    }
+    if (response.status != 0) {
         td_format_error(err, err_len, "rdma cas failed for node %d", session->endpoint.node_id);
         return -1;
     }
@@ -816,7 +853,10 @@ static int td_rdma_client_msg_control(td_session_t *session, td_wire_op_t op, ch
     request.flags = session->transport_profile != NULL ? TD_WIRE_FLAG_PROFILE : 0;
 
     start_ns = td_rdma_profile_begin(session);
-    if (td_rdma_client_msg_exchange(session, &request, NULL, &response, NULL, err, err_len) != 0 || response.status != 0) {
+    if (td_rdma_client_msg_exchange(session, &request, NULL, &response, NULL, err, err_len) != 0) {
+        return -1;
+    }
+    if (response.status != 0) {
         td_format_error(err, err_len, "rdma control op %u failed", (unsigned int)op);
         return -1;
     }
@@ -1099,12 +1139,20 @@ static int td_rdma_host_service_conn(td_rdma_host_conn_t *conn, char *err, size_
             return -1;
         }
         if (n == 0) {
+            uint64_t now_ns = td_now_ns();
+
+            if (now_ns >= conn->next_wait_diag_ns) {
+                fprintf(stdout, "tdx-dist mn rdma msg wait no_completion\n");
+                fflush(stdout);
+                conn->next_wait_diag_ns = now_ns + TD_RDMA_MSG_WAIT_DIAG_NS;
+            }
             return 0;
         }
         if (wc.status != IBV_WC_SUCCESS) {
             td_format_error(err, err_len, "rdma host completion failed status=%d", wc.status);
             return -1;
         }
+        conn->next_wait_diag_ns = td_now_ns() + TD_RDMA_MSG_WAIT_DIAG_NS;
         if (wc.wr_id == TD_RDMA_WRID_RECV && wc.opcode == IBV_WC_RECV) {
             if (td_rdma_host_handle_msg_request(conn, (size_t)wc.byte_len, err, err_len) != 0) {
                 return -1;
@@ -1125,6 +1173,7 @@ static int td_rdma_host_setup_conn(
     conn->region = region;
     conn->eviction_threshold_pct = cfg->eviction_threshold_pct;
     conn->msg_mode = (cfg->mode == TD_MODE_MN && cfg->tdx == TD_TDX_ON) ? 1 : 0;
+    conn->next_wait_diag_ns = td_now_ns() + TD_RDMA_MSG_WAIT_DIAG_NS;
     conn->pd = ibv_alloc_pd(conn->id->verbs);
     conn->cq = ibv_create_cq(conn->id->verbs, 128, NULL, NULL, 0);
     if (conn->pd == NULL || conn->cq == NULL) {
