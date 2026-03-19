@@ -89,7 +89,8 @@ static int td_fetch_slot_at(td_session_t *session, td_region_kind_t kind, size_t
 }
 
 static int td_commit_slot_at(td_session_t *session, td_region_kind_t kind, size_t slot_index, const td_slot_t *slot, uint64_t compare_epoch, uint64_t *observed_epoch, td_commit_timing_t *timing, char *err, size_t err_len) {
-    if (session->transport == TD_TRANSPORT_RDMA) {
+    if (session->transport == TD_TRANSPORT_RDMA &&
+        (session->transport_flags & TD_RDMA_CONNECT_FLAG_MSG) == 0) {
         td_request_result_t result;
         uint64_t start_ns = timing != NULL ? td_now_ns() : 0;
         int rc = td_remote_commit_request(session, kind, slot_index, slot, compare_epoch, &result, err, err_len);
@@ -1104,7 +1105,8 @@ int td_cluster_execute(td_cluster_t *cluster, const char *line, FILE *out) {
     if (strcmp(cmd, "evict") == 0) {
         size_t idx;
         for (idx = 0; idx < cluster->session_count; ++idx) {
-            if (cluster->config.transport == TD_TRANSPORT_RDMA) {
+            if (cluster->config.transport == TD_TRANSPORT_RDMA &&
+                (cluster->sessions[idx].transport_flags & TD_RDMA_CONNECT_FLAG_MSG) == 0) {
                 td_request_result_t result;
 
                 if (td_remote_evict_request(&cluster->sessions[idx], &result, err, sizeof(err)) != 0) {

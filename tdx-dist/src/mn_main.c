@@ -156,6 +156,10 @@ static void *td_rdma_host_thread(void *arg) {
     return NULL;
 }
 
+static int td_rdma_uses_message_ops(const td_config_t *cfg) {
+    return cfg->transport == TD_TRANSPORT_RDMA && cfg->tdx == TD_TDX_ON;
+}
+
 int main(int argc, char **argv) {
     const char *config_path = NULL;
     td_config_t cfg;
@@ -209,8 +213,13 @@ int main(int argc, char **argv) {
     td_print_memory_layout(&cfg, &region);
     fflush(stdout);
 
-    if (cfg.transport == TD_TRANSPORT_RDMA) {
+    if (cfg.transport == TD_TRANSPORT_RDMA && !td_rdma_uses_message_ops(&cfg)) {
         rc = td_request_server_run(&region, &td_stop, cfg.eviction_threshold_pct, err, sizeof(err));
+    } else if (cfg.transport == TD_TRANSPORT_RDMA) {
+        rc = 0;
+        while (!td_stop) {
+            usleep(100000);
+        }
     } else {
         rc = td_tcp_server_run(&cfg, &region, &td_stop, err, sizeof(err));
     }

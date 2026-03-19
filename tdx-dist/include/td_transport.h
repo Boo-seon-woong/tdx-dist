@@ -17,6 +17,7 @@ typedef enum {
 } td_wire_op_t;
 
 #define TD_WIRE_FLAG_PROFILE 0x1u
+#define TD_RDMA_CONNECT_FLAG_MSG 0x1u
 
 typedef struct {
     uint32_t magic;
@@ -116,6 +117,7 @@ typedef struct td_session {
     td_endpoint_t endpoint;
     uint64_t remote_addr;
     uint32_t rkey;
+    uint32_t transport_flags;
     td_region_header_t header;
     size_t region_size;
     void *impl;
