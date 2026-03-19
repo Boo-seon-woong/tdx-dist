@@ -17,7 +17,7 @@ static int td_region_is_owner(const td_config_t *cfg) {
     if (cfg->mode == TD_MODE_HOST) {
         return 1;
     }
-    if (cfg->mode == TD_MODE_MN && cfg->transport == TD_TRANSPORT_TCP) {
+    if (cfg->mode == TD_MODE_MN) {
         return 1;
     }
     return 0;
