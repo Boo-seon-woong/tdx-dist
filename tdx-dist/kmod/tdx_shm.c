@@ -120,7 +120,7 @@ static int tdx_shm_mmap(struct file *file, struct vm_area_struct *vma)
 		return rc;
 
 	obj->size = size;
-	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
 	rc = vm_map_pages_zero(vma, obj->pages, obj->npages);
 	if (rc != 0)
